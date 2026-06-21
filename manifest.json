@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Solana DEX Risk Scanner",
+  "version": "3.0.0",
+  "description": "Analyzes Solana tokens on DexScreener using RugCheck on-chain data and trading metrics to calculate risk scores.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*.dexscreener.com/*",
+    "https://api.rugcheck.xyz/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.dexscreener.com/*"],
+      "js": ["src/content/index.iife.tsx"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_popup": "options.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
