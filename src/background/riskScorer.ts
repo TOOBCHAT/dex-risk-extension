@@ -74,6 +74,7 @@ interface NormalizedSignals {
   // ── External (supporting evidence only) ──
   rugCheckScore: number;
   rugCheckClean: boolean;       // RC score ≤ 20 = externally validated
+  rugCheckVerified: boolean;    // RC score ≤ 10 = very high trust, suppress most penalties
   rugCheckDangerCount: number;
   rugCheckDangerReasons: string[];
   isConfirmedRug: boolean;
@@ -92,8 +93,9 @@ function normalizeSignals(sec: SecurityProfile, m: TradingMetrics): NormalizedSi
   const buyRatio = totalTxns > 0 ? m.buys / totalTxns : 0.5;
 
   // Solana chain context: pump.fun tokens never have LP locks
-  // LP lock is only relevant for traditional AMM pairs
-  const isLpRelevant = sec.lpLockedPct > 0 || !sec.mintAuthorityRevoked;
+  // LP lock is only relevant for traditional AMM pairs that actually have LP
+  // AND where the token creator has revoked mint authority (non-bonding-curve)
+  const isLpRelevant = sec.lpLockedPct > 0 && sec.mintAuthorityRevoked;
 
   // Honeypot: require substantial evidence before flagging
   // buys > 50 AND sells === 0 AND age > 10min = high confidence
@@ -107,6 +109,8 @@ function normalizeSignals(sec: SecurityProfile, m: TradingMetrics): NormalizedSi
   const hasApiData = sec.rugCheckScore !== 50; // 50 = our neutral default
   // RugCheck clean: score ≤ 20 means the token passed external validation
   const rugCheckClean = hasApiData && sec.rugCheckScore <= 20;
+  // RugCheck verified: score ≤ 10 = very high trust (e.g. USDC=1, BONK=7)
+  const rugCheckVerified = hasApiData && sec.rugCheckScore <= 10;
 
   // Pump.fun detection: most pump.fun bonding-curve tokens have mint
   // authority active (required for the bonding curve mechanism) but
@@ -139,6 +143,7 @@ function normalizeSignals(sec: SecurityProfile, m: TradingMetrics): NormalizedSi
     marketCapUSD: m.marketCapUSD,
     rugCheckScore: sec.rugCheckScore,
     rugCheckClean,
+    rugCheckVerified,
     rugCheckDangerCount: dangerRisks.length,
     rugCheckDangerReasons: dangerRisks.slice(0, 3).map(r => `${r.name}: ${r.description}`),
     isConfirmedRug: sec.isRugged,
@@ -205,14 +210,18 @@ function scoreSmartContract(s: NormalizedSignals, cfg: RiskCheckConfig['smartCon
   const reasons: string[] = [];
 
   if (cfg.checkMintAuthority && s.mintEnabled) {
-    if (s.isLikelyPumpFun) {
+    if (s.rugCheckVerified) {
+      // RugCheck verified this token as very safe — near-zero penalty
+      raw += 1;
+      reasons.push('🔓 Mint active (RugCheck verified safe)');
+    } else if (s.isLikelyPumpFun) {
       // Pump.fun bonding curve tokens NEED mint authority to function.
       // RugCheck already validated this token — minimal penalty.
-      raw += 3;
+      raw += 2;
       reasons.push('🔓 Mint active (normal for pump.fun bonding curve)');
     } else if (s.rugCheckClean) {
       // RugCheck says it's okay but it's not a pump.fun pattern
-      raw += 5;
+      raw += 3;
       reasons.push('🔓 Mint authority active (RugCheck: clean)');
     } else {
       raw += 15;
@@ -225,9 +234,13 @@ function scoreSmartContract(s: NormalizedSignals, cfg: RiskCheckConfig['smartCon
   // because each signal maps to one category. If user disables Smart
   // Contract but enables Honeypot, freeze still gets caught there.
   if (cfg.checkFreezeAuthority && s.freezeEnabled) {
-    if (s.rugCheckClean) {
+    if (s.rugCheckVerified) {
+      // RugCheck verified — no penalty for freeze authority
+      raw += 0;
+      reasons.push('🧊 Freeze authority active (RugCheck verified safe)');
+    } else if (s.rugCheckClean) {
       // RugCheck validated — likely a program-level authority, not malicious
-      raw += 2;
+      raw += 1;
       reasons.push('🧊 Freeze authority active (RugCheck: clean)');
     } else {
       raw += 10;
@@ -292,16 +305,22 @@ function scoreHolders(s: NormalizedSignals, cfg: RiskCheckConfig['holderDistribu
   // We can't exclude them without wallet-level data, so we use higher
   // thresholds to compensate for this noise.
   if (cfg.checkWhaleConcentration && s.whaleConcentration > cfg.whaleThreshold) {
-    const excess = s.whaleConcentration - cfg.whaleThreshold;
-    if (excess > 30) {
-      raw += 8;
-      reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% (incl. LP/burn) — extreme`);
-    } else if (excess > 15) {
-      raw += 4;
-      reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% — concentrated`);
+    // Skip whale penalty for RugCheck-verified tokens since top holders
+    // often include LP pools and burn wallets that inflate the concentration
+    if (s.rugCheckVerified) {
+      reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% (includes LP/burn — RugCheck verified)`);
     } else {
-      raw += 2;
-      reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% — above ${cfg.whaleThreshold}% threshold`);
+      const excess = s.whaleConcentration - cfg.whaleThreshold;
+      if (excess > 30) {
+        raw += 8;
+        reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% (incl. LP/burn) — extreme`);
+      } else if (excess > 15) {
+        raw += 4;
+        reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% — concentrated`);
+      } else {
+        raw += 2;
+        reasons.push(`🐋 Top holders own ${s.whaleConcentration.toFixed(0)}% — above ${cfg.whaleThreshold}% threshold`);
+      }
     }
   }
 
@@ -422,18 +441,28 @@ function scoreRugCheckFlags(s: NormalizedSignals, cfg: RiskCheckConfig['rugcheck
   // false positives on trending tokens that are perfectly legitimate.
   if (cfg.trustRugCheckScore && s.hasApiData) {
     if (s.rugCheckScore <= 5) {
-      raw -= 10;
+      raw -= 15;
       reasons.push(`✅ RugCheck: ${s.rugCheckScore} (very clean)`);
+    } else if (s.rugCheckScore <= 10) {
+      raw -= 12;
+      reasons.push(`✅ RugCheck: ${s.rugCheckScore} (verified clean)`);
     } else if (s.rugCheckScore <= 20) {
-      raw -= 7;
+      raw -= 10;
       reasons.push(`✅ RugCheck: ${s.rugCheckScore} (clean)`);
     } else if (s.rugCheckScore <= 40) {
-      raw -= 3;
+      raw -= 5;
       reasons.push(`✅ RugCheck: ${s.rugCheckScore} (okay)`);
     } else if (s.rugCheckScore > 60) {
       raw += 3;
       reasons.push(`⚠️ RugCheck: ${s.rugCheckScore} (flagged)`);
     }
+  }
+
+  // Global alignment bonus: when all positive signals converge,
+  // the token is overwhelmingly likely to be legitimate.
+  if (s.rugCheckVerified && s.ageMinutes > 1440 && s.volumeUSD > 50_000) {
+    raw -= 5;
+    reasons.push('✅ Verified + established + active trading');
   }
 
   return { score: Math.max(0, Math.round(raw * wMul(cfg.weight))), reasons };

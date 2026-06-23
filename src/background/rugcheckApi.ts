@@ -11,11 +11,70 @@
  *   - Known risk flags
  *
  * No API key required for the public endpoints.
+ *
+ * IMPORTANT: DexScreener token rows contain PAIR addresses (LP pool),
+ * not TOKEN MINT addresses. RugCheck requires the mint address.
+ * We resolve pair → mint via the DexScreener API before calling RugCheck.
  */
 
 import type { RugCheckSummary, RugCheckReport, SecurityProfile } from '../types';
 
 const API_BASE = 'https://api.rugcheck.xyz/v1';
+const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex';
+
+// ─── Mint Address Resolution ────────────────────────────────────
+
+/**
+ * Cache for pair address → mint address resolution.
+ * Avoids repeated DexScreener API calls for the same pair.
+ */
+const mintResolutionCache = new Map<string, string>();
+
+/**
+ * Resolves a DexScreener pair address to the actual token mint address
+ * using the DexScreener pairs API.
+ *
+ * The content script extracts pair addresses from row hrefs (e.g. /solana/<pairAddr>),
+ * but RugCheck needs the token mint address. This function bridges that gap.
+ *
+ * Returns the original address if resolution fails (graceful fallback).
+ */
+export async function resolveMintAddress(address: string): Promise<string> {
+  // Check cache first
+  if (mintResolutionCache.has(address)) {
+    return mintResolutionCache.get(address)!;
+  }
+
+  try {
+    const res = await fetch(`${DEXSCREENER_API}/pairs/solana/${address}`, {
+      headers: { 'Accept': 'application/json' },
+    });
+
+    if (!res.ok) {
+      console.warn(`[DEX Risk] DexScreener pair lookup failed for ${address}: ${res.status}`);
+      return address;
+    }
+
+    const data = await res.json();
+
+    // DexScreener returns { pair: {...} } for single pair lookups
+    // or { pairs: [...] } for search results
+    const pair = data.pair || (Array.isArray(data.pairs) && data.pairs[0]);
+
+    if (pair?.baseToken?.address) {
+      const mint = pair.baseToken.address;
+      console.log(`[DEX Risk] Resolved pair ${address.slice(0, 8)}… → mint ${mint.slice(0, 8)}… (${pair.baseToken.symbol})`);
+      mintResolutionCache.set(address, mint);
+      return mint;
+    }
+
+    console.warn(`[DEX Risk] DexScreener pair lookup: no baseToken found for ${address}`);
+    return address;
+  } catch (err) {
+    console.error(`[DEX Risk] DexScreener pair resolution error for ${address}:`, err);
+    return address;
+  }
+}
 
 // ─── API Fetchers ───────────────────────────────────────────────
 
@@ -77,10 +136,17 @@ export async function fetchRugCheckReport(mint: string): Promise<RugCheckReport 
 
 /**
  * Builds a SecurityProfile from RugCheck data.
- * Uses summary for speed; falls back to defaults if API fails.
+ *
+ * First resolves the address to a token mint (in case a pair address
+ * was passed), then fetches RugCheck data using the real mint.
  */
-export async function buildSecurityProfile(mint: string): Promise<SecurityProfile> {
-  // Fetch both in parallel — summary is fast, report gives us holder data
+export async function buildSecurityProfile(address: string): Promise<SecurityProfile> {
+  // Step 1: Resolve pair address → token mint address
+  // The content script may pass either a pair address or a mint address.
+  // resolveMintAddress handles both cases (returns the mint either way).
+  const mint = await resolveMintAddress(address);
+
+  // Step 2: Fetch both in parallel — summary is fast, report gives us holder data
   const [summary, report] = await Promise.all([
     fetchRugCheckSummary(mint),
     fetchRugCheckReport(mint),
@@ -103,7 +169,12 @@ export async function buildSecurityProfile(mint: string): Promise<SecurityProfil
     rugCheckRisks: [],
   };
 
-  if (!summary && !report) return defaults;
+  if (!summary && !report) {
+    console.warn(`[DEX Risk] Both RugCheck endpoints returned null for mint ${mint} (original: ${address})`);
+    return defaults;
+  }
+
+  console.log(`[DEX Risk] RugCheck data received for ${mint}: score=${summary?.score_normalised ?? report?.score_normalised}, risks=${(summary?.risks ?? report?.risks ?? []).length}`);
 
   // ── From summary ──
   const lpLockedPct = summary?.lpLockedPct ?? 0;
