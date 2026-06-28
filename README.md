@@ -96,7 +96,7 @@ Once you have the compiled code (either from the **Pre-built Archive** or the **
 
 ## 🤝 Contributors
 
-* **Aman Patel** - [GitHub Profile](https://github.com/amanpatel1208)
-* **Snehashis Chatterjee** - [GitHub Profile](https://github.com/TOOBCHAT)
+* **Snehashis Chatterjee** (Lead Author) - [GitHub Profile](https://github.com/TOOBCHAT)
+* **Aman Patel** (Collaborator) - [GitHub Profile](https://github.com/amanpatel1208)
 
-*This project was collaboratively built by both of us.*
+*This project was led by Snehashis Chatterjee, with collaborative contributions from Aman Patel.*
